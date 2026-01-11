@@ -114,12 +114,28 @@ The demo simulates an "AI Trends Research" mission with 17 events:
 
 ## API Endpoints
 
-| Method | Endpoint              | Description                          |
-| ------ | --------------------- | ------------------------------------ |
-| POST   | `/api/missions/start` | Create a new mission                 |
-| GET    | `/api/missions/get`   | Get mission + events by `missionId`  |
-| POST   | `/api/events/emit`    | Emit an event (idempotent)           |
-| POST   | `/api/dev/reset`      | Clear all data (dev only)            |
+| Method | Endpoint              | Description                                      |
+| ------ | --------------------- | ------------------------------------------------ |
+| POST   | `/api/missions/start` | Create a new mission                             |
+| GET    | `/api/missions/get`   | Get mission + events by `missionId`              |
+| GET    | `/api/missions/list`  | List all missions (newest first, max 50)         |
+| POST   | `/api/missions/fork`  | Fork a mission from a specific step              |
+| POST   | `/api/events/emit`    | Emit an event (idempotent)                       |
+| POST   | `/api/dev/reset`      | Clear all data (dev only)                        |
+
+### Fork Endpoint
+
+The fork endpoint allows you to create a new mission that branches off from an existing mission at a specific step:
+
+```bash
+POST /api/missions/fork
+{
+  "parentMissionId": "...",
+  "forkStep": 6
+}
+```
+
+This copies all events up to and including `forkStep`, creates a new mission with status "running", and returns the new `missionId`. Useful for exploring alternative branches or retrying from a checkpoint.
 
 ## Architecture Highlights
 
@@ -150,7 +166,9 @@ swarmboard/
 │   ├── api/
 │   │   ├── missions/
 │   │   │   ├── start/route.ts
-│   │   │   └── get/route.ts
+│   │   │   ├── get/route.ts
+│   │   │   ├── list/route.ts
+│   │   │   └── fork/route.ts
 │   │   ├── events/
 │   │   │   └── emit/route.ts
 │   │   └── dev/

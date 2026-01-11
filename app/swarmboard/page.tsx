@@ -2,11 +2,13 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { demoScript } from "@/lib/demoScript";
-import { Mission, MissionEvent, AgentType, EventType } from "@/lib/types";
+import { Mission, MissionEvent, AgentType, RunMode } from "@/lib/types";
+import { getTotalSteps } from "@/lib/stepSchedule";
 
 const STORAGE_KEY = "swarmboard:missionId";
 const POLL_INTERVAL = 800;
 const REPLAY_BASE_INTERVAL = 450;
+const TICK_INTERVAL = 20000; // 20 seconds between ticks (free tier: 3 RPM limit)
 
 type ViewMode = "live" | "replay";
 type ReplaySpeed = 1 | 2 | 4;
@@ -25,7 +27,11 @@ export default function SwarmBoard() {
   const [missionId, setMissionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
+  // Run mode state
+  const [selectedRunMode, setSelectedRunMode] = useState<RunMode>("scripted");
+  const [openaiConfigured, setOpenaiConfigured] = useState<boolean | null>(null);
+
   // Crash simulation state
   const [isCrashed, setIsCrashed] = useState(false);
   const [crashedAtStep, setCrashedAtStep] = useState<number | null>(null);
@@ -54,7 +60,22 @@ export default function SwarmBoard() {
   const scheduledStepsRef = useRef<Set<number>>(new Set());
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const replayIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const tickIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
+
+  const totalSteps = getTotalSteps();
+
+  // Check if OpenAI is configured on mount
+  useEffect(() => {
+    fetch("/api/agents/status")
+      .then((res) => res.json())
+      .then((data) => {
+        setOpenaiConfigured(data.openaiConfigured);
+      })
+      .catch(() => {
+        setOpenaiConfigured(false);
+      });
+  }, []);
 
   // Get last checkpoint step
   const getLastCheckpointStep = useCallback((evts: MissionEvent[]): number | null => {
@@ -112,12 +133,12 @@ export default function SwarmBoard() {
     }
   }, []);
 
-  // Emit event
+  // Emit event (for scripted mode)
   const emitEvent = useCallback(async (
     missionId: string,
     step: number,
     agent: AgentType,
-    type: EventType,
+    type: string,
     summary: string,
     payload: Record<string, unknown>
   ) => {
@@ -125,7 +146,7 @@ export default function SwarmBoard() {
       const res = await fetch("/api/events/emit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ missionId, step, agent, type, summary, payload }),
+        body: JSON.stringify({ missionId, step, agent, type, summary, payload, source: "scripted" }),
       });
       if (!res.ok) {
         console.error("Failed to emit event:", await res.text());
@@ -135,7 +156,25 @@ export default function SwarmBoard() {
     }
   }, []);
 
-  // Schedule demo events
+  // Tick for real mode
+  const tick = useCallback(async (id: string) => {
+    try {
+      const res = await fetch("/api/agents/tick", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ missionId: id }),
+      });
+      if (!res.ok) {
+        console.error("Tick failed:", await res.text());
+      }
+      return await res.json();
+    } catch (err) {
+      console.error("Error ticking:", err);
+      return null;
+    }
+  }, []);
+
+  // Schedule demo events (scripted mode)
   const scheduleDemoEvents = useCallback((currentMissionId: string, startFromStep: number) => {
     const eventsToSchedule = demoScript.filter(
       (e) => e.step > startFromStep && !scheduledStepsRef.current.has(e.step)
@@ -159,6 +198,30 @@ export default function SwarmBoard() {
       }, cumulativeDelay);
     });
   }, [emitEvent]);
+
+  // Start tick loop (real mode)
+  const startTickLoop = useCallback((id: string) => {
+    if (tickIntervalRef.current) {
+      clearInterval(tickIntervalRef.current);
+    }
+    tickIntervalRef.current = setInterval(async () => {
+      const result = await tick(id);
+      if (result?.status === "done" || result?.status === "failed") {
+        // Mission finished, stop ticking
+        if (tickIntervalRef.current) {
+          clearInterval(tickIntervalRef.current);
+          tickIntervalRef.current = null;
+        }
+      }
+    }, TICK_INTERVAL);
+  }, [tick]);
+
+  const stopTickLoop = useCallback(() => {
+    if (tickIntervalRef.current) {
+      clearInterval(tickIntervalRef.current);
+      tickIntervalRef.current = null;
+    }
+  }, []);
 
   // Polling
   const startPolling = useCallback((id: string) => {
@@ -187,13 +250,14 @@ export default function SwarmBoard() {
 
   const startReplay = useCallback((fromCheckpoint: boolean = false) => {
     if (events.length === 0) return;
-    
+
     stopPolling();
     stopReplay();
-    
+    stopTickLoop();
+
     const eventsToReplay = [...events];
     let startIndex = 0;
-    
+
     if (fromCheckpoint) {
       const checkpointIdx = eventsToReplay.findIndex((e) => e.type === "CHECKPOINT");
       if (checkpointIdx >= 0) {
@@ -204,21 +268,21 @@ export default function SwarmBoard() {
         startIndex = lastCheckpointIdx;
       }
     }
-    
+
     setReplayEvents(eventsToReplay);
     setReplayIndex(startIndex);
     setVisibleEvents(eventsToReplay.slice(0, startIndex));
     setReplayFinished(false);
     setReplayFromCheckpoint(fromCheckpoint);
     setMode("replay");
-  }, [events, stopPolling, stopReplay]);
+  }, [events, stopPolling, stopReplay, stopTickLoop]);
 
   // Replay tick effect
   useEffect(() => {
     if (mode !== "replay" || replayFinished) return;
 
     const interval = REPLAY_BASE_INTERVAL / replaySpeed;
-    
+
     replayIntervalRef.current = setInterval(() => {
       setReplayIndex((prev) => {
         const nextIndex = prev + 1;
@@ -245,11 +309,15 @@ export default function SwarmBoard() {
     setVisibleEvents([]);
     setReplayIndex(0);
     setReplayFinished(false);
-    
+
     if (missionId) {
       startPolling(missionId);
+      // Resume tick loop if real mode and running
+      if (mission?.runMode === "real" && mission?.status === "running") {
+        startTickLoop(missionId);
+      }
     }
-  }, [stopReplay, missionId, startPolling]);
+  }, [stopReplay, missionId, mission, startPolling, startTickLoop]);
 
   const restartReplay = useCallback(() => {
     startReplay(replayFromCheckpoint);
@@ -264,22 +332,30 @@ export default function SwarmBoard() {
         startPolling(missionId);
 
         if (data.mission.status === "running") {
-          scheduleDemoEvents(missionId, data.mission.currentStep);
+          if (data.mission.runMode === "real") {
+            // Real mode: start tick loop
+            startTickLoop(missionId);
+          } else {
+            // Scripted mode: schedule events
+            scheduleDemoEvents(missionId, data.mission.currentStep);
+          }
         }
       }
     });
 
     return () => {
       stopPolling();
+      stopTickLoop();
     };
-  }, [missionId, isCrashed, mode, fetchMission, startPolling, stopPolling, scheduleDemoEvents]);
+  }, [missionId, isCrashed, mode, fetchMission, startPolling, stopPolling, scheduleDemoEvents, startTickLoop, stopTickLoop]);
 
-  // Stop polling when mission done
+  // Stop polling/ticking when mission done
   useEffect(() => {
     if (mission?.status === "done" && mode === "live") {
       stopPolling();
+      stopTickLoop();
     }
-  }, [mission?.status, mode, stopPolling]);
+  }, [mission?.status, mode, stopPolling, stopTickLoop]);
 
   // Auto-scroll timeline
   useEffect(() => {
@@ -293,8 +369,9 @@ export default function SwarmBoard() {
     return () => {
       stopPolling();
       stopReplay();
+      stopTickLoop();
     };
-  }, [stopPolling, stopReplay]);
+  }, [stopPolling, stopReplay, stopTickLoop]);
 
   // Handlers
   const handleStartDemo = async () => {
@@ -302,9 +379,14 @@ export default function SwarmBoard() {
     setError(null);
     scheduledStepsRef.current.clear();
     exitReplay();
+    stopTickLoop();
 
     try {
-      const res = await fetch("/api/missions/start", { method: "POST" });
+      const res = await fetch("/api/missions/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runMode: selectedRunMode }),
+      });
       if (!res.ok) throw new Error("Failed to start mission");
 
       const data = await res.json();
@@ -315,7 +397,14 @@ export default function SwarmBoard() {
 
       await fetchMission(newMissionId);
       startPolling(newMissionId);
-      scheduleDemoEvents(newMissionId, 1);
+
+      if (selectedRunMode === "real") {
+        // Real mode: start tick loop
+        startTickLoop(newMissionId);
+      } else {
+        // Scripted mode: schedule events
+        scheduleDemoEvents(newMissionId, 1);
+      }
     } catch (err) {
       console.error("Error starting demo:", err);
       setError("Failed to start demo mission");
@@ -327,6 +416,7 @@ export default function SwarmBoard() {
   const handleCrash = () => {
     stopPolling();
     stopReplay();
+    stopTickLoop();
     scheduledStepsRef.current.clear();
     setCrashedAtStep(mission?.currentStep || 0);
     setIsCrashed(true);
@@ -335,17 +425,21 @@ export default function SwarmBoard() {
   const handleRecover = async () => {
     setIsRecovering(true);
     await new Promise(resolve => setTimeout(resolve, 1500));
-    
+
     setIsCrashed(false);
     setIsRecovering(false);
     setMode("live");
-    
+
     if (missionId) {
       const data = await fetchMission(missionId);
       if (data && data.mission) {
         startPolling(missionId);
         if (data.mission.status === "running") {
-          scheduleDemoEvents(missionId, data.mission.currentStep);
+          if (data.mission.runMode === "real") {
+            startTickLoop(missionId);
+          } else {
+            scheduleDemoEvents(missionId, data.mission.currentStep);
+          }
         }
       }
     }
@@ -354,6 +448,7 @@ export default function SwarmBoard() {
   const handleReset = async () => {
     stopPolling();
     stopReplay();
+    stopTickLoop();
     scheduledStepsRef.current.clear();
     localStorage.removeItem(STORAGE_KEY);
     setMissionId(null);
@@ -380,7 +475,7 @@ export default function SwarmBoard() {
 
   const handleFork = async () => {
     if (!missionId || !mission) return;
-    
+
     setIsForking(true);
     try {
       const res = await fetch("/api/missions/fork", {
@@ -388,28 +483,33 @@ export default function SwarmBoard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ parentMissionId: missionId, forkStep }),
       });
-      
+
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || "Failed to fork mission");
       }
-      
+
       const data = await res.json();
       const newMissionId = data.missionId;
-      
+
       exitReplay();
+      stopTickLoop();
       localStorage.setItem(STORAGE_KEY, newMissionId);
       setMissionId(newMissionId);
       scheduledStepsRef.current.clear();
-      
+
       const missionData = await fetchMission(newMissionId);
       if (missionData && missionData.mission) {
         startPolling(newMissionId);
         if (missionData.mission.status === "running") {
-          scheduleDemoEvents(newMissionId, missionData.mission.currentStep);
+          if (missionData.mission.runMode === "real") {
+            startTickLoop(newMissionId);
+          } else {
+            scheduleDemoEvents(newMissionId, missionData.mission.currentStep);
+          }
         }
       }
-      
+
       setShowForkModal(false);
     } catch (err) {
       console.error("Error forking:", err);
@@ -428,19 +528,24 @@ export default function SwarmBoard() {
   const handleSelectMission = async (selectedMissionId: string) => {
     exitReplay();
     stopPolling();
+    stopTickLoop();
     scheduledStepsRef.current.clear();
-    
+
     localStorage.setItem(STORAGE_KEY, selectedMissionId);
     setMissionId(selectedMissionId);
-    
+
     const data = await fetchMission(selectedMissionId);
     if (data && data.mission) {
       startPolling(selectedMissionId);
       if (data.mission.status === "running") {
-        scheduleDemoEvents(selectedMissionId, data.mission.currentStep);
+        if (data.mission.runMode === "real") {
+          startTickLoop(selectedMissionId);
+        } else {
+          scheduleDemoEvents(selectedMissionId, data.mission.currentStep);
+        }
       }
     }
-    
+
     setShowHistoryPanel(false);
   };
 
@@ -466,8 +571,8 @@ export default function SwarmBoard() {
   const agentLatest = getAgentLatestEvents(displayEvents);
   const activeAgents = Object.entries(agentLatest).filter(([, e]) => e !== null);
 
-  const replayCheckpointSummary = mode === "replay" 
-    ? [...visibleEvents].reverse().find((e) => e.type === "CHECKPOINT")?.summary 
+  const replayCheckpointSummary = mode === "replay"
+    ? [...visibleEvents].reverse().find((e) => e.type === "CHECKPOINT")?.summary
     : null;
 
   // Crash Screen
@@ -478,7 +583,7 @@ export default function SwarmBoard() {
           <div className="text-center max-w-2xl px-8">
             <h1 className="text-6xl font-bold text-gray-800 mb-4">502</h1>
             <h2 className="text-2xl text-gray-600 mb-8">Bad Gateway</h2>
-            
+
             <div className="bg-gray-100 border border-gray-300 p-6 mb-8 text-left text-sm text-gray-700">
               <p className="mb-2">The server encountered a temporary error and could not complete your request.</p>
               <p className="mb-4">Please try again in 30 seconds.</p>
@@ -488,7 +593,7 @@ export default function SwarmBoard() {
 
             <div className="bg-cream-100 border border-cream-400 p-6 rounded-md text-left mb-6">
               <p className="text-sm text-ink-600 mb-2">
-                <span className="font-semibold">Application crashed at step {crashedAtStep}/{demoScript.length}</span>
+                <span className="font-semibold">Application crashed at step {crashedAtStep}/{totalSteps}</span>
               </p>
               <p className="text-sm text-ink-500 mb-4">
                 All progress has been persisted to MongoDB Atlas. Click below to recover and continue from where you left off.
@@ -498,6 +603,12 @@ export default function SwarmBoard() {
                 <span>MongoDB Atlas: Connected</span>
                 <span className="mx-2">|</span>
                 <span>{events.length} events preserved</span>
+                {mission?.runMode === "real" && (
+                  <>
+                    <span className="mx-2">|</span>
+                    <span>Mode: Real (GPT)</span>
+                  </>
+                )}
               </div>
             </div>
 
@@ -537,28 +648,39 @@ export default function SwarmBoard() {
         <div className="max-w-[1800px] mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              <h1 className="text-xl font-semibold tracking-tight">SwarmBoard</h1>
-              
+              <h1 className="text-xl font-semibold tracking-tight">Mission:Possible</h1>
+
               {/* Mode Badge */}
               <span className={`text-xs font-mono px-2 py-1 rounded ${
-                mode === "replay" 
-                  ? "bg-purple-100 text-purple-700 border border-purple-300" 
+                mode === "replay"
+                  ? "bg-purple-100 text-purple-700 border border-purple-300"
                   : "bg-cream-200 text-ink-500 border border-cream-400"
               }`}>
                 {mode === "replay" ? "REPLAY" : "LIVE"}
               </span>
 
+              {/* Run Mode Badge */}
+              {mission && mode === "live" && (
+                <span className={`text-xs font-mono px-2 py-1 rounded ${
+                  mission.runMode === "real"
+                    ? "bg-emerald-100 text-emerald-700 border border-emerald-300"
+                    : "bg-cream-200 text-ink-500 border border-cream-400"
+                }`}>
+                  {mission.runMode === "real" ? "BYOK" : "DEMO"}
+                </span>
+              )}
+
               {mission && mode === "live" && (
                 <div className="flex items-center gap-4 ml-2 border-l border-cream-400 pl-4">
                   <div className="flex items-center gap-2">
                     <span className={`w-2 h-2 rounded-sm ${
-                      mission.status === "running" ? "bg-ink-900 status-pulse" 
+                      mission.status === "running" ? "bg-ink-900 status-pulse"
                         : mission.status === "done" ? "bg-ink-400" : "bg-ink-300"
                     }`} />
                     <span className="text-sm font-mono text-ink-500 uppercase">{mission.status}</span>
                   </div>
                   <span className="text-sm font-mono text-ink-400">
-                    Step {mission.currentStep}/{demoScript.length}
+                    Step {mission.currentStep}/{totalSteps}
                   </span>
                 </div>
               )}
@@ -610,8 +732,8 @@ export default function SwarmBoard() {
                         key={speed}
                         onClick={() => setReplaySpeed(speed)}
                         className={`px-3 py-2 text-sm font-mono ${
-                          replaySpeed === speed 
-                            ? "bg-purple-100 text-purple-700" 
+                          replaySpeed === speed
+                            ? "bg-purple-100 text-purple-700"
                             : "bg-cream-50 text-ink-500 hover:bg-cream-100"
                         }`}
                       >
@@ -619,7 +741,7 @@ export default function SwarmBoard() {
                       </button>
                     ))}
                   </div>
-                  
+
                   {replayFinished && (
                     <button
                       onClick={restartReplay}
@@ -628,7 +750,7 @@ export default function SwarmBoard() {
                       Replay Again
                     </button>
                   )}
-                  
+
                   <button
                     onClick={exitReplay}
                     className="px-3 py-2 border border-cream-400 text-ink-500 font-medium text-sm rounded-md hover:bg-cream-200 hover:border-cream-500 hover:text-ink-900 transition-all duration-150"
@@ -697,7 +819,7 @@ export default function SwarmBoard() {
             <span className="text-cream-400">|</span>
             <span>Replay, Fork, or Crash to explore</span>
             <span className="text-cream-400">|</span>
-            <span>Multi-agent orchestration</span>
+            <span>{mission?.runMode === "real" ? "GPT-generated events" : "Multi-agent orchestration"}</span>
           </div>
         </div>
       </div>
@@ -724,7 +846,7 @@ export default function SwarmBoard() {
                 </svg>
               </button>
             </div>
-            
+
             <div className="flex-1 overflow-y-auto p-4">
               {isLoadingHistory ? (
                 <div className="flex items-center justify-center py-8">
@@ -739,20 +861,20 @@ export default function SwarmBoard() {
                   {allMissions.map((m) => {
                     const isCurrentMission = m._id?.toString() === missionId;
                     const isFork = !!m.branchFromMissionId;
-                    
+
                     return (
                       <button
                         key={m._id?.toString()}
                         onClick={() => handleSelectMission(m._id.toString())}
                         className={`w-full p-4 border rounded-md text-left transition-all duration-150 ${
-                          isCurrentMission 
-                            ? "border-ink-400 bg-cream-200" 
+                          isCurrentMission
+                            ? "border-ink-400 bg-cream-200"
                             : "border-cream-400 bg-cream-50 hover:border-cream-500 hover:bg-cream-100"
                         }`}
                       >
                         <div className="flex items-start justify-between gap-4">
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1">
+                            <div className="flex items-center gap-2 mb-1 flex-wrap">
                               <span className="font-medium text-sm truncate">{m.title}</span>
                               {isCurrentMission && (
                                 <span className="text-xs bg-ink-900 text-cream-50 px-2 py-0.5 rounded">Current</span>
@@ -760,27 +882,30 @@ export default function SwarmBoard() {
                               {isFork && (
                                 <span className="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded">Fork</span>
                               )}
+                              {m.runMode === "real" && (
+                                <span className="text-xs bg-emerald-100 text-emerald-600 px-2 py-0.5 rounded">BYOK</span>
+                              )}
                             </div>
-                            
+
                             <div className="flex items-center gap-3 text-xs text-ink-400 font-mono">
                               <span className={`uppercase ${
-                                m.status === "running" ? "text-green-600" 
-                                  : m.status === "done" ? "text-ink-500" 
+                                m.status === "running" ? "text-green-600"
+                                  : m.status === "done" ? "text-ink-500"
                                   : "text-red-500"
                               }`}>
                                 {m.status}
                               </span>
-                              <span>Step {m.currentStep}/{demoScript.length}</span>
+                              <span>Step {m.currentStep}/{totalSteps}</span>
                               <span>{new Date(m.createdAt).toLocaleString()}</span>
                             </div>
-                            
+
                             {isFork && m.branchFromMissionId && (
                               <div className="mt-2 text-xs text-blue-500">
                                 Forked from ...{m.branchFromMissionId.toString().slice(-8)} at step {m.branchFromStep}
                               </div>
                             )}
                           </div>
-                          
+
                           <div className="text-xs font-mono text-ink-300">
                             ...{m._id?.toString().slice(-8)}
                           </div>
@@ -791,7 +916,7 @@ export default function SwarmBoard() {
                 </div>
               )}
             </div>
-            
+
             <div className="p-4 border-t border-cream-400 bg-cream-100 text-xs text-ink-400 text-center font-mono">
               {allMissions.length} mission{allMissions.length !== 1 ? "s" : ""} total
             </div>
@@ -804,7 +929,7 @@ export default function SwarmBoard() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-cream-50 border border-cream-400 rounded-md p-6 max-w-md w-full mx-4">
             <h3 className="text-lg font-semibold mb-4">Fork Mission</h3>
-            
+
             <div className="mb-4">
               <p className="text-sm text-ink-500 mb-2">Parent Mission</p>
               <p className="text-xs font-mono text-ink-400 bg-cream-200 p-2 rounded">
@@ -867,7 +992,7 @@ export default function SwarmBoard() {
           <div className="flex items-center justify-center min-h-[600px]">
             <div className="max-w-2xl w-full">
               <div className="text-center mb-12">
-                <h2 className="text-4xl font-semibold mb-3 tracking-tight">SwarmBoard</h2>
+                <h2 className="text-4xl font-semibold mb-3 tracking-tight">Mission:Possible</h2>
                 <p className="text-ink-400 text-lg">Multi-agent mission control</p>
               </div>
 
@@ -877,8 +1002,8 @@ export default function SwarmBoard() {
                   <p className="text-sm text-ink-600">Four specialized agents collaborate on complex tasks</p>
                 </div>
                 <div className="p-5 border border-cream-400 bg-cream-50 rounded-md hover:border-cream-500 transition-colors">
-                  <div className="text-xs font-mono text-ink-400 uppercase tracking-wider mb-2">Replay & Fork</div>
-                  <p className="text-sm text-ink-600">Replay past runs or fork from any step</p>
+                  <div className="text-xs font-mono text-ink-400 uppercase tracking-wider mb-2">Modes</div>
+                  <p className="text-sm text-ink-600">Demo mode or BYOK with your own API key</p>
                 </div>
                 <div className="p-5 border border-cream-400 bg-cream-50 rounded-md hover:border-cream-500 transition-colors">
                   <div className="text-xs font-mono text-ink-400 uppercase tracking-wider mb-2">Recovery</div>
@@ -891,12 +1016,49 @@ export default function SwarmBoard() {
                   <p className="text-ink-500 mb-6 text-sm">
                     Watch agents collaborate in real-time with full crash recovery
                   </p>
+
+                  {/* Run Mode Selector */}
+                  <div className="flex justify-center mb-6">
+                    <div className="flex items-center border border-cream-400 rounded-md overflow-hidden">
+                      <button
+                        onClick={() => setSelectedRunMode("scripted")}
+                        className={`px-4 py-2 text-sm font-medium ${
+                          selectedRunMode === "scripted"
+                            ? "bg-ink-900 text-cream-50"
+                            : "bg-cream-50 text-ink-500 hover:bg-cream-100"
+                        }`}
+                      >
+                        Demo
+                      </button>
+                      <button
+                        onClick={() => openaiConfigured && setSelectedRunMode("real")}
+                        disabled={!openaiConfigured}
+                        className={`px-4 py-2 text-sm font-medium ${
+                          selectedRunMode === "real"
+                            ? "bg-emerald-600 text-white"
+                            : openaiConfigured
+                              ? "bg-cream-50 text-ink-500 hover:bg-cream-100"
+                              : "bg-cream-100 text-ink-300 cursor-not-allowed"
+                        }`}
+                        title={!openaiConfigured ? "OPENAI_API_KEY not configured" : "Bring Your Own Key - GPT generates events"}
+                      >
+                        BYOK
+                      </button>
+                    </div>
+                  </div>
+
+                  {!openaiConfigured && openaiConfigured !== null && (
+                    <p className="text-xs text-ink-400 mb-4">
+                      Set OPENAI_API_KEY to enable BYOK mode
+                    </p>
+                  )}
+
                   <button
                     onClick={handleStartDemo}
                     disabled={isLoading}
                     className="px-8 py-3 bg-ink-900 text-cream-50 font-medium rounded-md disabled:opacity-40 hover:bg-ink-700 active:bg-ink-800 transition-all duration-150"
                   >
-                    {isLoading ? "Initializing..." : "Start Demo Mission"}
+                    {isLoading ? "Initializing..." : `Start ${selectedRunMode === "real" ? "BYOK" : "Demo"} Mission`}
                   </button>
                 </div>
               </div>
@@ -907,11 +1069,11 @@ export default function SwarmBoard() {
                   <div className="text-xs font-mono text-ink-400 uppercase">Agents</div>
                 </div>
                 <div>
-                  <div className="text-2xl font-mono text-ink-900">17</div>
+                  <div className="text-2xl font-mono text-ink-900">{totalSteps}</div>
                   <div className="text-xs font-mono text-ink-400 uppercase">Events</div>
                 </div>
                 <div>
-                  <div className="text-2xl font-mono text-ink-900">~45s</div>
+                  <div className="text-2xl font-mono text-ink-900">~{selectedRunMode === "real" ? "30" : "45"}s</div>
                   <div className="text-xs font-mono text-ink-400 uppercase">Duration</div>
                 </div>
               </div>
@@ -987,8 +1149,8 @@ export default function SwarmBoard() {
                       >
                         <div
                           className={`p-4 border bg-cream-50 rounded-md transition-all duration-150 hover:border-cream-500 ${
-                            isHighlighted 
-                              ? mode === "replay" ? "border-purple-400" : "border-ink-300" 
+                            isHighlighted
+                              ? mode === "replay" ? "border-purple-400" : "border-ink-300"
                               : "border-cream-400"
                           }`}
                         >
@@ -1002,7 +1164,7 @@ export default function SwarmBoard() {
                             </div>
 
                             <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 mb-1">
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
                                 <span className="text-xs font-mono bg-cream-200 px-2 py-0.5 rounded text-ink-500">
                                   {agentLabels[event.agent]}
                                 </span>
@@ -1041,9 +1203,16 @@ export default function SwarmBoard() {
 
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-ink-400">Mode</span>
+                    <span className="text-sm text-ink-400">View</span>
                     <span className={`text-sm font-mono uppercase ${mode === "replay" ? "text-purple-600" : "text-ink-900"}`}>
                       {mode}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-ink-400">Run Mode</span>
+                    <span className={`text-sm font-mono uppercase ${mission.runMode === "real" ? "text-emerald-600" : "text-ink-900"}`}>
+                      {mission.runMode === "real" ? "BYOK" : "Demo"}
                     </span>
                   </div>
 
@@ -1058,7 +1227,7 @@ export default function SwarmBoard() {
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-ink-400">Current Step</span>
                       <span className="text-xl font-mono">
-                        {mission.currentStep}<span className="text-ink-400 text-sm">/{demoScript.length}</span>
+                        {mission.currentStep}<span className="text-ink-400 text-sm">/{totalSteps}</span>
                       </span>
                     </div>
                   )}
@@ -1067,19 +1236,21 @@ export default function SwarmBoard() {
                     <div className="flex items-center justify-between text-xs text-ink-400 mb-2">
                       <span>Progress</span>
                       <span>
-                        {mode === "replay" 
+                        {mode === "replay"
                           ? Math.round((visibleEvents.length / replayEvents.length) * 100) || 0
-                          : Math.round((mission.currentStep / demoScript.length) * 100)
+                          : Math.round((mission.currentStep / totalSteps) * 100)
                         }%
                       </span>
                     </div>
                     <div className="h-1 bg-cream-300 rounded-sm overflow-hidden">
                       <div
-                        className={`h-full transition-all duration-500 ${mode === "replay" ? "bg-purple-400" : "bg-ink-400"}`}
+                        className={`h-full transition-all duration-500 ${
+                          mode === "replay" ? "bg-purple-400" : mission.runMode === "real" ? "bg-emerald-400" : "bg-ink-400"
+                        }`}
                         style={{
-                          width: `${mode === "replay" 
+                          width: `${mode === "replay"
                             ? (visibleEvents.length / replayEvents.length) * 100 || 0
-                            : (mission.currentStep / demoScript.length) * 100
+                            : (mission.currentStep / totalSteps) * 100
                           }%`,
                         }}
                       />
@@ -1133,11 +1304,11 @@ export default function SwarmBoard() {
       <footer className="border-t border-cream-400 bg-cream-50 py-3">
         <div className="max-w-[1800px] mx-auto px-6">
           <div className="flex items-center justify-between text-xs font-mono text-ink-400">
-            <span>SwarmBoard MVP</span>
+            <span>Mission:Possible</span>
             <span>
-              {mode === "replay" 
-                ? `Replay: ${replaySpeed}x | ${visibleEvents.length}/${replayEvents.length} events` 
-                : `Poll: ${POLL_INTERVAL}ms | Events: ${events.length}`
+              {mode === "replay"
+                ? `Replay: ${replaySpeed}x | ${visibleEvents.length}/${replayEvents.length} events`
+                : `Poll: ${POLL_INTERVAL}ms | ${mission?.runMode === "real" ? `Tick: ${TICK_INTERVAL}ms` : "Scripted"} | Events: ${events.length}`
               }
             </span>
           </div>

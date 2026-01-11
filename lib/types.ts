@@ -15,6 +15,8 @@ export type EventType =
   | "RETRY"
   | "DONE";
 
+export type RunMode = "scripted" | "real";
+
 export interface Mission {
   _id: ObjectId;
   title: string;
@@ -29,6 +31,10 @@ export interface Mission {
   // Fork/branch fields
   branchFromMissionId?: ObjectId;
   branchFromStep?: number;
+  // Run mode fields
+  runMode: RunMode;
+  llmProvider?: "openai";
+  llmModel?: string;
 }
 
 export interface MissionEvent {
@@ -40,6 +46,7 @@ export interface MissionEvent {
   type: EventType;
   summary: string;
   payload: Record<string, unknown>;
+  source?: "scripted" | "openai" | "fallback";
 }
 
 // API response types
@@ -52,6 +59,11 @@ export interface StartMissionResponse {
   missionId: string;
 }
 
+export interface StartMissionBody {
+  title?: string;
+  runMode?: RunMode;
+}
+
 export interface EmitEventBody {
   missionId: string;
   step: number;
@@ -59,6 +71,7 @@ export interface EmitEventBody {
   type: EventType;
   summary: string;
   payload?: Record<string, unknown>;
+  source?: "scripted" | "openai" | "fallback";
 }
 
 export interface ForkMissionBody {
@@ -68,4 +81,24 @@ export interface ForkMissionBody {
 
 export interface ForkMissionResponse {
   missionId: string;
+}
+
+export interface TickBody {
+  missionId: string;
+}
+
+export interface TickResponse {
+  ok: boolean;
+  step?: number;
+  used?: "openai" | "fallback";
+  event?: MissionEvent;
+  status?: MissionStatus;
+  error?: string;
+}
+
+// Step schedule for state machine
+export interface StepSchedule {
+  step: number;
+  agent: AgentType;
+  type: EventType;
 }

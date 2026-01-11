@@ -1,11 +1,23 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import { getMissionsCollection, getEventsCollection, ensureIndexes } from "@/lib/mongo";
+import { StartMissionBody, RunMode } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-export async function POST() {
+export async function POST(request: NextRequest) {
   try {
+    // Parse request body (optional)
+    let body: StartMissionBody = {};
+    try {
+      body = await request.json();
+    } catch {
+      // Empty body is fine, use defaults
+    }
+
+    const runMode: RunMode = body.runMode === "real" ? "real" : "scripted";
+    const title = body.title || "AI Trends Research Mission";
+
     // Ensure indexes exist for idempotency
     await ensureIndexes();
 
@@ -15,16 +27,25 @@ export async function POST() {
     const now = new Date();
     const missionId = new ObjectId();
 
-    // Create the mission
-    await missions.insertOne({
+    // Create the mission with runMode
+    const missionDoc: Record<string, unknown> = {
       _id: missionId,
-      title: "AI Trends Research Mission",
+      title,
       status: "running",
       currentStep: 1,
       createdAt: now,
       updatedAt: now,
       artifacts: {},
-    });
+      runMode,
+    };
+
+    // Add LLM fields if real mode
+    if (runMode === "real") {
+      missionDoc.llmProvider = "openai";
+      missionDoc.llmModel = process.env.OPENAI_MODEL || "o3-mini";
+    }
+
+    await missions.insertOne(missionDoc);
 
     // Insert initial PLAN event (step 1)
     await events.insertOne({
@@ -35,7 +56,8 @@ export async function POST() {
       agent: "Planner",
       type: "PLAN",
       summary: "Mission initialized: Research and summarize latest AI trends",
-      payload: { objective: "AI Trends Research", estimatedSteps: 16 },
+      payload: { objective: "AI Trends Research", estimatedSteps: 17 },
+      source: "scripted",
     });
 
     return NextResponse.json({ missionId: missionId.toString() });
@@ -47,4 +69,3 @@ export async function POST() {
     );
   }
 }
-

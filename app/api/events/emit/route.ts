@@ -12,6 +12,7 @@ interface EmitEventBody {
   type: EventType;
   summary: string;
   payload?: Record<string, unknown>;
+  source?: "scripted" | "openai" | "fallback";
 }
 
 const validAgents: AgentType[] = ["Planner", "Researcher", "Executor", "Critic"];
@@ -92,6 +93,7 @@ export async function POST(request: NextRequest) {
         type: body.type,
         summary: body.summary,
         payload: body.payload || {},
+        source: body.source || "scripted",
       });
     } catch (insertError: unknown) {
       // Check if it's a duplicate key error (E11000)

@@ -15,7 +15,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SwarmBoard | Multi-Agent Mission Control",
+  title: "MissionPossible | Multi-Agent Mission Control",
   description: "Real-time dashboard for multi-agent workflows powered by MongoDB Atlas",
 };
 

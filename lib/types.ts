@@ -26,6 +26,9 @@ export interface Mission {
   artifacts: {
     latestSummary?: string;
   };
+  // Fork/branch fields
+  branchFromMissionId?: ObjectId;
+  branchFromStep?: number;
 }
 
 export interface MissionEvent {
@@ -58,3 +61,11 @@ export interface EmitEventBody {
   payload?: Record<string, unknown>;
 }
 
+export interface ForkMissionBody {
+  parentMissionId: string;
+  forkStep: number;
+}
+
+export interface ForkMissionResponse {
+  missionId: string;
+}
